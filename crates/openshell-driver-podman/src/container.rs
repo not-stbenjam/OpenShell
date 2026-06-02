@@ -4,7 +4,7 @@
 //! Container spec construction for the Podman driver.
 
 use crate::config::PodmanComputeConfig;
-use openshell_core::gpu::cdi_gpu_device_ids;
+use openshell_core::gpu::{CdiGpuSelectionError, cdi_gpu_device_ids};
 use openshell_core::proto::compute::v1::DriverSandbox;
 use serde::Serialize;
 use serde_json::Value;
@@ -374,13 +374,20 @@ fn podman_pids_limit(value: i64) -> Option<i64> {
 }
 
 /// Build CDI GPU device list if GPU is requested.
-fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
-    let spec = sandbox.spec.as_ref()?;
-    cdi_gpu_device_ids(spec.gpu, &spec.gpu_device).map(|device_ids| {
-        device_ids
-            .into_iter()
-            .map(|path| LinuxDevice { path })
-            .collect()
+fn build_devices(
+    sandbox: &DriverSandbox,
+    selected_default_device: Option<&str>,
+) -> Result<Option<Vec<LinuxDevice>>, CdiGpuSelectionError> {
+    let Some(spec) = sandbox.spec.as_ref() else {
+        return Ok(None);
+    };
+    cdi_gpu_device_ids(spec.gpu, &spec.gpu_device, selected_default_device).map(|device_ids| {
+        device_ids.map(|device_ids| {
+            device_ids
+                .into_iter()
+                .map(|path| LinuxDevice { path })
+                .collect()
+        })
     })
 }
 
@@ -391,12 +398,23 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
     build_container_spec_with_token(sandbox, config, None)
 }
 
+#[cfg(test)]
 #[must_use]
 pub fn build_container_spec_with_token(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
     token_host_path: Option<&std::path::Path>,
 ) -> Value {
+    build_container_spec_with_token_and_gpu_default(sandbox, config, token_host_path, None)
+        .expect("container spec requires caller-selected default GPU device")
+}
+
+pub fn build_container_spec_with_token_and_gpu_default(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    token_host_path: Option<&std::path::Path>,
+    selected_default_device: Option<&str>,
+) -> Result<Value, CdiGpuSelectionError> {
     let image = resolve_image(sandbox, config);
     let name = container_name(&sandbox.name);
     let vol = volume_name(&sandbox.id);
@@ -404,7 +422,7 @@ pub fn build_container_spec_with_token(
     let env = build_env(sandbox, config, image);
     let labels = build_labels(sandbox);
     let resource_limits = build_resource_limits(sandbox, config);
-    let devices = build_devices(sandbox);
+    let devices = build_devices(sandbox, selected_default_device)?;
 
     // Network configuration -- always bridge mode.
     // Matches libpod's network spec format `{name: {opts}}`; the unit-struct
@@ -616,7 +634,7 @@ pub fn build_container_spec_with_token(
         }],
     };
 
-    serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail")
+    Ok(serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail"))
 }
 
 fn hostadd_entries(config: &PodmanComputeConfig) -> Vec<String> {
@@ -799,8 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_maps_empty_gpu_request_to_all_cdi_device() {
-        use openshell_core::config::CDI_GPU_DEVICE_ALL;
+    fn container_spec_maps_empty_gpu_request_to_selected_default_cdi_device() {
         use openshell_core::proto::compute::v1::DriverSandboxSpec;
 
         let mut sandbox = test_sandbox("test-id", "test-name");
@@ -809,12 +826,34 @@ mod tests {
             ..Default::default()
         });
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec_with_token_and_gpu_default(
+            &sandbox,
+            &config,
+            None,
+            Some("nvidia.com/gpu=1"),
+        )
+        .unwrap();
 
         assert_eq!(
             spec["devices"][0]["path"].as_str(),
-            Some(CDI_GPU_DEVICE_ALL)
+            Some("nvidia.com/gpu=1")
         );
+    }
+
+    #[test]
+    fn container_spec_rejects_missing_default_cdi_device() {
+        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            gpu: true,
+            ..Default::default()
+        });
+        let config = test_config();
+        let err = build_container_spec_with_token_and_gpu_default(&sandbox, &config, None, None)
+            .unwrap_err();
+
+        assert_eq!(err, CdiGpuSelectionError::MissingDefaultDevice);
     }
 
     #[test]

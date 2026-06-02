@@ -23,7 +23,9 @@ use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE, SUPERVISOR_IMAGE_BINARY_PATH,
 };
-use openshell_core::gpu::cdi_gpu_device_ids;
+use openshell_core::gpu::{
+    CdiGpuInventory, CdiGpuRoundRobin, CdiGpuSelectionError, cdi_gpu_device_ids,
+};
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -219,6 +221,7 @@ struct DockerDriverRuntimeConfig {
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
     supports_gpu: bool,
+    cdi_gpu_inventory: CdiGpuInventory,
     sandbox_pids_limit: i64,
 }
 
@@ -238,6 +241,7 @@ pub struct DockerComputeDriver {
     events: broadcast::Sender<WatchSandboxesEvent>,
     pending: Arc<Mutex<HashMap<String, PendingSandboxRecord>>>,
     supervisor_readiness: Arc<dyn SupervisorReadiness>,
+    gpu_selector: Arc<CdiGpuRoundRobin>,
 }
 
 struct PendingSandboxRecord {
@@ -278,6 +282,7 @@ impl DockerComputeDriver {
             .cdi_spec_dirs
             .as_ref()
             .is_some_and(|dirs| !dirs.is_empty());
+        let cdi_gpu_inventory = docker_cdi_gpu_inventory(&info);
         validate_sandbox_pids_limit(docker_config.sandbox_pids_limit)?;
         let gateway_port = config.bind_address.port();
         if gateway_port == 0 {
@@ -325,11 +330,13 @@ impl DockerComputeDriver {
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
                 supports_gpu,
+                cdi_gpu_inventory,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             pending: Arc::new(Mutex::new(HashMap::new())),
             supervisor_readiness,
+            gpu_selector: Arc::new(CdiGpuRoundRobin::new()),
         };
 
         let poll_driver = driver.clone();
@@ -455,7 +462,12 @@ impl DockerComputeDriver {
     async fn create_sandbox_inner(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
         Self::validate_sandbox(sandbox, &self.config)?;
         Self::validate_sandbox_auth(sandbox)?;
-        let _ = build_container_create_body(sandbox, &self.config)?;
+        let selected_default_gpu = self.peek_default_gpu_device(sandbox)?;
+        let _ = build_container_create_body_with_default(
+            sandbox,
+            &self.config,
+            selected_default_gpu.as_deref(),
+        )?;
 
         if self
             .find_managed_container_summary(&sandbox.id, &sandbox.name)
@@ -529,7 +541,18 @@ impl DockerComputeDriver {
             })?;
 
         let container_name = container_name_for_sandbox(sandbox);
-        let create_body = build_container_create_body(sandbox, &self.config).map_err(|status| {
+        let selected_default_gpu = self.next_default_gpu_device(sandbox).map_err(|status| {
+            if token_file_created {
+                cleanup_sandbox_token_file(sandbox, &self.config);
+            }
+            DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
+        })?;
+        let create_body = build_container_create_body_with_default(
+            sandbox,
+            &self.config,
+            selected_default_gpu.as_deref(),
+        )
+        .map_err(|status| {
             if token_file_created {
                 cleanup_sandbox_token_file(sandbox, &self.config);
             }
@@ -969,6 +992,37 @@ impl DockerComputeDriver {
         );
     }
 
+    fn peek_default_gpu_device(&self, sandbox: &DriverSandbox) -> Result<Option<String>, Status> {
+        self.selected_default_gpu_device(sandbox, false)
+    }
+
+    fn next_default_gpu_device(&self, sandbox: &DriverSandbox) -> Result<Option<String>, Status> {
+        self.selected_default_gpu_device(sandbox, true)
+    }
+
+    fn selected_default_gpu_device(
+        &self,
+        sandbox: &DriverSandbox,
+        consume: bool,
+    ) -> Result<Option<String>, Status> {
+        let Some(spec) = sandbox.spec.as_ref() else {
+            return Ok(None);
+        };
+        if !spec.gpu || !spec.gpu_device.is_empty() {
+            return Ok(None);
+        }
+
+        let selected = if consume {
+            self.gpu_selector
+                .next_default_device_id(&self.config.cdi_gpu_inventory)
+        } else {
+            self.gpu_selector
+                .peek_default_device_id(&self.config.cdi_gpu_inventory)
+        }
+        .map_err(docker_gpu_selection_status)?;
+        Ok(Some(selected))
+    }
+
     async fn poll_loop(self) {
         let mut previous = match self.current_snapshot_map().await {
             Ok(snapshots) => snapshots,
@@ -1165,6 +1219,12 @@ impl ComputeDriver for DockerComputeDriver {
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         Self::validate_sandbox(&sandbox, &self.config)?;
+        let selected_default_gpu = self.peek_default_gpu_device(&sandbox)?;
+        let _ = build_container_create_body_with_default(
+            &sandbox,
+            &self.config,
+            selected_default_gpu.as_deref(),
+        )?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
@@ -1727,19 +1787,51 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         .collect()
 }
 
-fn docker_gpu_device_requests(gpu: bool, gpu_device: &str) -> Option<Vec<DeviceRequest>> {
-    cdi_gpu_device_ids(gpu, gpu_device).map(|device_ids| {
-        vec![DeviceRequest {
-            driver: Some("cdi".to_string()),
-            device_ids: Some(device_ids),
-            ..Default::default()
-        }]
-    })
+fn docker_cdi_gpu_inventory(info: &SystemInfo) -> CdiGpuInventory {
+    CdiGpuInventory::new(
+        info.discovered_devices
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|device| device.source.as_deref() == Some("cdi"))
+            .filter_map(|device| device.id.as_deref()),
+    )
 }
 
+fn docker_gpu_selection_status(err: CdiGpuSelectionError) -> Status {
+    Status::failed_precondition(err.to_string())
+}
+
+fn docker_gpu_device_requests(
+    gpu: bool,
+    gpu_device: &str,
+    selected_default_device: Option<&str>,
+) -> Result<Option<Vec<DeviceRequest>>, Status> {
+    cdi_gpu_device_ids(gpu, gpu_device, selected_default_device)
+        .map(|device_ids| {
+            device_ids.map(|device_ids| {
+                vec![DeviceRequest {
+                    driver: Some("cdi".to_string()),
+                    device_ids: Some(device_ids),
+                    ..Default::default()
+                }]
+            })
+        })
+        .map_err(docker_gpu_selection_status)
+}
+
+#[cfg(test)]
 fn build_container_create_body(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
+) -> Result<ContainerCreateBody, Status> {
+    build_container_create_body_with_default(sandbox, config, None)
+}
+
+fn build_container_create_body_with_default(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+    selected_default_device: Option<&str>,
 ) -> Result<ContainerCreateBody, Status> {
     let spec = sandbox
         .spec
@@ -1779,7 +1871,11 @@ fn build_container_create_body(
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
             pids_limit: docker_pids_limit(config.sandbox_pids_limit)?,
-            device_requests: docker_gpu_device_requests(spec.gpu, &spec.gpu_device),
+            device_requests: docker_gpu_device_requests(
+                spec.gpu,
+                &spec.gpu_device,
+                selected_default_device,
+            )?,
             binds: Some(build_binds(sandbox, config)?),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),

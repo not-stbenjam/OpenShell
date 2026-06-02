@@ -53,7 +53,9 @@ openshell sandbox create --gpu -- claude
 
 For Docker-backed sandboxes, GPU injection uses Docker CDI. If you enable Docker
 CDI after the gateway starts, restart the gateway so OpenShell can detect the
-updated Docker daemon capability.
+updated Docker daemon capability. For bare `--gpu` requests, Docker and Podman
+select one NVIDIA CDI GPU from the gateway-local inventory. Use `--gpu-device`
+with a CDI ID such as `nvidia.com/gpu=0` when you need a specific device.
 
 ### Custom Containers
 

@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use openshell_core::config::{CDI_GPU_DEVICE_ALL, DEFAULT_SERVER_PORT};
+use bollard::models::DeviceInfo;
+use openshell_core::config::DEFAULT_SERVER_PORT;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE,
@@ -73,8 +74,55 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         }),
         daemon_version: "28.0.0".to_string(),
         supports_gpu: false,
+        cdi_gpu_inventory: CdiGpuInventory::default(),
         sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
     }
+}
+
+#[test]
+fn docker_cdi_gpu_inventory_filters_discovered_cdi_gpu_devices() {
+    let info = SystemInfo {
+        discovered_devices: Some(vec![
+            DeviceInfo {
+                source: Some("cdi".to_string()),
+                id: Some("example.com/device=0".to_string()),
+            },
+            DeviceInfo {
+                source: Some("cdi".to_string()),
+                id: Some("nvidia.com/gpu=1".to_string()),
+            },
+            DeviceInfo {
+                source: Some("udev".to_string()),
+                id: Some("nvidia.com/gpu=2".to_string()),
+            },
+            DeviceInfo {
+                source: Some("cdi".to_string()),
+                id: Some("nvidia.com/gpu=0".to_string()),
+            },
+        ]),
+        ..Default::default()
+    };
+
+    let inventory = docker_cdi_gpu_inventory(&info);
+
+    assert_eq!(
+        inventory.as_slice(),
+        &vec![
+            "nvidia.com/gpu=0".to_string(),
+            "nvidia.com/gpu=1".to_string()
+        ]
+    );
+}
+
+#[test]
+fn docker_cdi_gpu_inventory_treats_missing_discovered_devices_as_empty() {
+    let info = SystemInfo {
+        cdi_spec_dirs: Some(vec!["/etc/cdi".to_string()]),
+        discovered_devices: None,
+        ..Default::default()
+    };
+
+    assert!(docker_cdi_gpu_inventory(&info).is_empty());
 }
 
 #[test]
@@ -599,13 +647,15 @@ fn validate_sandbox_auth_accepts_gateway_token() {
 }
 
 #[test]
-fn build_container_create_body_maps_gpu_to_all_cdi_device() {
+fn build_container_create_body_maps_gpu_to_selected_default_cdi_device() {
     let mut config = runtime_config();
     config.supports_gpu = true;
     let mut sandbox = test_sandbox();
     sandbox.spec.as_mut().unwrap().gpu = true;
 
-    let create_body = build_container_create_body(&sandbox, &config).unwrap();
+    let create_body =
+        build_container_create_body_with_default(&sandbox, &config, Some("nvidia.com/gpu=1"))
+            .unwrap();
     let request = create_body
         .host_config
         .as_ref()
@@ -616,7 +666,23 @@ fn build_container_create_body_maps_gpu_to_all_cdi_device() {
     assert_eq!(request.driver.as_deref(), Some("cdi"));
     assert_eq!(
         request.device_ids.as_ref().unwrap(),
-        &vec![CDI_GPU_DEVICE_ALL.to_string()]
+        &vec!["nvidia.com/gpu=1".to_string()]
+    );
+}
+
+#[test]
+fn build_container_create_body_rejects_missing_default_cdi_device() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().gpu = true;
+
+    let err = build_container_create_body(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        err.message(),
+        "GPU request requires a selected default CDI GPU device"
     );
 }
 
