@@ -74,6 +74,28 @@ fn collect_cdi_gpu_device_ids_from_devices(devices: &[Value], device_ids: &mut V
     }
 }
 
+fn local_podman_cdi_gpu_device_ids() -> Vec<String> {
+    let mut device_ids = std::fs::read_dir("/dev")
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let index = name.strip_prefix("nvidia")?;
+            (!index.is_empty() && index.chars().all(|ch| ch.is_ascii_digit()))
+                .then(|| format!("{CDI_GPU_DEVICE_PREFIX}{index}"))
+        })
+        .collect::<Vec<_>>();
+    device_ids.sort();
+    device_ids.dedup();
+    device_ids
+}
+
+fn uses_local_podman_inventory(engine: &ContainerEngine) -> bool {
+    engine.name().rsplit('/').next() == Some("podman")
+}
+
 fn parse_cdi_gpu_device_ids(info: &Value) -> Vec<String> {
     let mut device_ids = Vec::new();
 
@@ -91,6 +113,16 @@ fn parse_cdi_gpu_device_ids(info: &Value) -> Vec<String> {
 
 fn discovered_cdi_gpu_device_ids() -> Vec<String> {
     let engine = ContainerEngine::from_env();
+    if uses_local_podman_inventory(&engine) {
+        let device_ids = local_podman_cdi_gpu_device_ids();
+        assert!(
+            !device_ids.is_empty(),
+            "local Podman GPU e2e tests require /dev/nvidiaN device nodes so \
+bare --gpu can be mapped to nvidia.com/gpu=N"
+        );
+        return device_ids;
+    }
+
     let output = engine
         .command()
         .args(["info", "--format", "json"])
@@ -118,10 +150,43 @@ fn discovered_cdi_gpu_device_ids() -> Vec<String> {
     assert!(
         !device_ids.is_empty(),
         "{} info --format json did not report any discovered NVIDIA CDI GPU devices. \
-Expected DiscoveredDevices entries with Source=cdi and ID like nvidia.com/gpu=all.",
+Expected DiscoveredDevices entries with Source=cdi and ID like nvidia.com/gpu=0.",
         engine.name()
     );
     device_ids
+}
+
+fn default_cdi_gpu_device_id(device_ids: &[String]) -> Option<String> {
+    let mut indexed = device_ids
+        .iter()
+        .filter_map(|device_id| {
+            let suffix = device_id.strip_prefix(CDI_GPU_DEVICE_PREFIX)?;
+            let index = suffix.parse::<u64>().ok()?;
+            Some((index, device_id.clone()))
+        })
+        .collect::<Vec<_>>();
+    if !indexed.is_empty() {
+        indexed.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        return indexed.into_iter().map(|(_, device_id)| device_id).next();
+    }
+
+    let mut uuid_style = device_ids
+        .iter()
+        .filter(|device_id| {
+            device_id.starts_with(CDI_GPU_DEVICE_PREFIX)
+                && device_id.as_str() != CDI_GPU_DEVICE_ALL
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !uuid_style.is_empty() {
+        uuid_style.sort();
+        return uuid_style.into_iter().next();
+    }
+
+    device_ids
+        .iter()
+        .any(|device_id| device_id == CDI_GPU_DEVICE_ALL)
+        .then(|| CDI_GPU_DEVICE_ALL.to_string())
 }
 
 fn has_cdi_gpu_device(device_id: &str) -> bool {
@@ -210,20 +275,19 @@ async fn sandbox_create_output(args: &[&str]) -> String {
 }
 
 #[tokio::test]
-async fn gpu_request_without_device_matches_plain_all_gpu_container() {
-    if !has_cdi_gpu_device(CDI_GPU_DEVICE_ALL) {
-        eprintln!(
-            "skipping default GPU request test because {CDI_GPU_DEVICE_ALL} was not discovered"
-        );
+async fn gpu_request_without_device_matches_plain_default_gpu_container() {
+    let device_ids = discovered_cdi_gpu_device_ids();
+    let Some(default_gpu_device) = default_cdi_gpu_device_id(&device_ids) else {
+        eprintln!("skipping default GPU request test because no selectable GPU ID was discovered");
         return;
-    }
+    };
 
-    let expected = runtime_gpu_lines(CDI_GPU_DEVICE_ALL);
+    let expected = runtime_gpu_lines(&default_gpu_device);
     let actual = sandbox_gpu_lines(None).await;
 
     assert_eq!(
         actual, expected,
-        "default GPU request should expose the same GPU lines as a plain all-GPU container"
+        "default GPU request should expose the same GPU lines as a plain container using {default_gpu_device}"
     );
 }
 

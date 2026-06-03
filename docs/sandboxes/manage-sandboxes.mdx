@@ -62,9 +62,10 @@ CDI after the gateway starts, restart the gateway so OpenShell can detect the
 updated Docker daemon capability.
 
 Kubernetes gateways honor `--gpu-count` by setting the `nvidia.com/gpu` resource
-limit. Docker and Podman support explicit CDI device IDs through `--gpu-device`
-but do not support count-based selection yet. VM gateways accept only one GPU.
-In the API, these flags populate `SandboxSpec.resource_requirements.gpu`.
+limit. Docker and Podman use CDI device IDs and select concrete NVIDIA CDI
+devices for default and count-based GPU requests. VM gateways accept only one
+GPU. In the API, these flags populate
+`SandboxSpec.resource_requirements.gpu`.
 
 ### Custom Containers
 

@@ -42,7 +42,9 @@ but currently ignores them.
 
 GPU requests enter the driver layer through
 `SandboxSpec.resource_requirements.gpu`. The compact interim shape supports a
-default GPU request, GPU count, and driver-specific device IDs.
+default GPU request, GPU count, and driver-specific device IDs. Docker and
+Podman map default and count requests to concrete NVIDIA CDI device IDs before
+creating the sandbox container.
 
 VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a
