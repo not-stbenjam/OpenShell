@@ -17,13 +17,13 @@ Each workload image must:
 - Use the OpenShell community base image as its final-stage base.
 - Install the workload at `/usr/local/bin/openshell-gpu-workload`.
 - Run the same workload as the image default entrypoint for direct
-  container-engine validation and OpenShell sandbox execution.
+  container-engine validation.
 - Require no network access after the image is pulled.
 - Print `OPENSHELL_GPU_WORKLOAD_SUCCESS` only when validation succeeds.
 - Print `OPENSHELL_GPU_WORKLOAD_FAILURE` and exit non-zero when validation
   fails.
-- Be usable as an OpenShell sandbox image with `openshell sandbox create
-  --from <image>`.
+- Be usable as an OpenShell sandbox image when OpenShell invokes
+  `/usr/local/bin/openshell-gpu-workload` explicitly.
 
 ## Images
 
@@ -113,9 +113,14 @@ OPENSHELL_E2E_GPU_CUDA_WORKLOAD_IMAGE
 
 When the variable is unset or empty, the workload validation test prints a
 clear skip message and returns without failing. When it is set, the test uses
-the image directly as the sandbox image with `openshell sandbox create --gpu
---from <image>` and requires `OPENSHELL_GPU_WORKLOAD_SUCCESS` in the combined
-output.
+the image directly as the sandbox image and runs:
+
+```text
+/usr/local/bin/openshell-gpu-workload
+```
+
+through `openshell sandbox create --gpu --from <image> -- <command>`. The
+test then requires `OPENSHELL_GPU_WORKLOAD_SUCCESS` in the combined output.
 
 ## Publish Guidance
 
