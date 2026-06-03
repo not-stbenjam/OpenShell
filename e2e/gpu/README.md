@@ -3,12 +3,13 @@
 
 # GPU workload images
 
-This directory defines GPU workload images used by OpenShell GPU e2e tests.
+This directory defines workload test images currently used by the OpenShell GPU
+e2e suite.
 
 The image definitions live here first so the OpenShell e2e harness can iterate
-against a concrete contract. The long-term image ownership should move to
-`NVIDIA/OpenShell-Community`; OpenShell should then keep the contract, local
-build task, and tests that consume published image refs.
+against a concrete workload manifest. The long-term image ownership should move
+to `NVIDIA/OpenShell-Community`; OpenShell should then keep the manifest
+contract, local build task, and tests that consume published image refs.
 
 ## Contract
 
@@ -25,6 +26,14 @@ Each workload image must:
 - Be usable as an OpenShell sandbox image when OpenShell invokes
   `/usr/local/bin/openshell-gpu-workload` explicitly.
 
+The test harness is manifest-driven. Each workload entry carries:
+
+- `name`
+- `image`
+- `command`
+- `expect`
+- `requirements`
+
 ## Images
 
 | Source directory | Image name | Purpose |
@@ -38,14 +47,14 @@ Each workload image must:
 Build all workload images:
 
 ```shell
-mise run e2e:gpu:images:build
+mise run e2e:workloads:build
 ```
 
 Build a subset by source directory name:
 
 ```shell
 OPENSHELL_GPU_WORKLOAD_IMAGES=smoke-pass,smoke-fail \
-mise run e2e:gpu:images:build
+mise run e2e:workloads:build
 ```
 
 The build task uses `tasks/scripts/container-engine.sh`. Set
@@ -61,11 +70,25 @@ The task writes the latest build refs to:
 e2e/gpu/images/.build/latest.env
 ```
 
-Use it in later commands:
+The task also writes the local workload manifest used by the Rust e2e runner:
+
+```text
+e2e/gpu/images/.build/workloads.yaml
+```
+
+That local manifest is created by `mise run e2e:workloads:build`. It contains
+the full image reference, command, expected outcome, and requirements for each
+selected workload.
+
+Use the env file in later commands:
 
 ```shell
 source e2e/gpu/images/.build/latest.env
 ```
+
+That env file exports `OPENSHELL_E2E_WORKLOAD_MANIFEST` pointing at the local
+manifest. The per-image refs remain available as a convenience for direct
+container-engine validation.
 
 ## Direct Validation
 
@@ -97,7 +120,7 @@ where Podman CDI is configured.
 Direct container-engine validation catches image, CDI, CUDA, and host GPU setup
 issues before OpenShell sandbox behavior is involved.
 
-## Rust E2E Validation
+## Manifest-Driven Validation
 
 The Rust GPU validation target is:
 
@@ -105,30 +128,65 @@ The Rust GPU validation target is:
 cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker-gpu --test gpu -- --nocapture
 ```
 
-The CUDA workload validation path reads:
+The workload validation path reads:
 
 ```text
-OPENSHELL_E2E_GPU_CUDA_WORKLOAD_IMAGE
+OPENSHELL_E2E_WORKLOAD_MANIFEST
 ```
 
-When the variable is unset or empty, the workload validation test prints a
-clear skip message and returns without failing. When it is set, the test uses
-the image directly as the sandbox image and runs:
+When that variable is unset, the runner uses the default local manifest path:
+
+```text
+e2e/gpu/images/.build/workloads.yaml
+```
+
+If neither path exists, the workload validation test prints a clear skip
+message telling you to run:
+
+```shell
+mise run e2e:workloads:build
+```
+
+or to set `OPENSHELL_E2E_WORKLOAD_MANIFEST` to an external manifest.
+
+Each manifest entry supplies the sandbox image and command. OpenShell runs:
 
 ```text
 /usr/local/bin/openshell-gpu-workload
 ```
 
-through `openshell sandbox create --gpu --from <image> -- <command>`. The
-test then requires `OPENSHELL_GPU_WORKLOAD_SUCCESS` in the combined output.
+through `openshell sandbox create --gpu --from <image> -- <command>`. The test
+runner iterates all GPU-tagged workload entries and enforces each entry's
+declared expectation:
+
+- `expect: pass` requires `OPENSHELL_GPU_WORKLOAD_SUCCESS`
+- `expect: fail` requires `OPENSHELL_GPU_WORKLOAD_FAILURE`
+
+The current local manifest includes three workloads:
+
+- `smoke-pass` expected to pass
+- `smoke-fail` expected to fail
+- `cuda-basic` expected to pass
+
+## External Manifests
+
+External workload catalogs can use the same schema. Point the runner at one
+with:
+
+```shell
+export OPENSHELL_E2E_WORKLOAD_MANIFEST=/abs/path/to/workloads.yaml
+```
+
+That lets partner-supplied or published workload manifests use the same test
+runner without introducing per-workload env vars.
 
 ## Publish Guidance
 
 Published tests should reference immutable image refs:
 
 ```shell
-OPENSHELL_E2E_GPU_CUDA_WORKLOAD_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/gpu-workload-cuda-basic@sha256:<digest>
+OPENSHELL_E2E_WORKLOAD_MANIFEST=/abs/path/to/published-workloads.yaml
 ```
 
-Mutable tags are acceptable for local iteration. CI should use a digest or an
-immutable release tag once the images are published from OpenShell-Community.
+The published manifest should use immutable image refs such as digests or
+release tags once the images are published from OpenShell-Community.
