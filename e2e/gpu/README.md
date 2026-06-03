@@ -17,17 +17,13 @@ Each workload image must:
 - Use the OpenShell community base image as its final-stage base.
 - Install the workload at `/usr/local/bin/openshell-gpu-workload`.
 - Run the same workload as the image default entrypoint for direct
-  container-engine validation.
+  container-engine validation and OpenShell sandbox execution.
 - Require no network access after the image is pulled.
 - Print `OPENSHELL_GPU_WORKLOAD_SUCCESS` only when validation succeeds.
 - Print `OPENSHELL_GPU_WORKLOAD_FAILURE` and exit non-zero when validation
   fails.
 - Be usable as an OpenShell sandbox image with `openshell sandbox create
   --from <image>`.
-
-OpenShell sandbox creation replaces the image entrypoint with the supervisor and
-does not run the OCI image `CMD`. E2e tests that use these images through
-OpenShell should run `/usr/local/bin/openshell-gpu-workload` explicitly.
 
 ## Images
 
@@ -100,6 +96,26 @@ where Podman CDI is configured.
 
 Direct container-engine validation catches image, CDI, CUDA, and host GPU setup
 issues before OpenShell sandbox behavior is involved.
+
+## Rust E2E Validation
+
+The Rust GPU validation target is:
+
+```shell
+cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker-gpu --test gpu -- --nocapture
+```
+
+The CUDA workload validation path reads:
+
+```text
+OPENSHELL_E2E_GPU_CUDA_WORKLOAD_IMAGE
+```
+
+When the variable is unset or empty, the workload validation test prints a
+clear skip message and returns without failing. When it is set, the test uses
+the image directly as the sandbox image with `openshell sandbox create --gpu
+--from <image>` and requires `OPENSHELL_GPU_WORKLOAD_SUCCESS` in the combined
+output.
 
 ## Publish Guidance
 
