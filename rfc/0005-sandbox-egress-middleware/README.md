@@ -65,7 +65,7 @@ graph LR
     MW["Middleware service<br/>(operator-run)"]
     UP["Upstream service"]
 
-    SUP -.->|"fetches config<br/>(supervisor-initiated)"| GW
+    GW -. "config (supervisor-initiated)" .- SUP
     AGENT -->|"outbound request"| SUP
     SUP -->|"request content + context"| MW
     MW -->|"decision + transformed<br/>content + metadata"| SUP
@@ -231,7 +231,14 @@ What other designs have been considered? What is the impact of not doing this?
 
 ## Prior art
 
-Does this feature exist in other projects? What can we learn from them?
+Calling an external service from a proxy to inspect, transform, or block in-flight traffic is well-established. The closest analogs:
+
+- **Envoy `ext_proc` (External Processing).** The primary model for this RFC. Envoy streams request headers and body to an external gRPC service that can mutate the body (for example redaction), allow, or deny, and the proxy and the processing service scale independently. Our `request.before_upstream` hook is effectively a buffered, single-hook v1 of the same boundary, with the proto shaped to grow toward `ext_proc`-style streaming later.
+- **Envoy `ext_authz` (External Authorization).** A narrower sibling: an external service returns an allow/deny decision per request. It validates the "delegate the per-request decision to an external service in the hot path" pattern, without the content-transformation half that this RFC needs.
+- **ICAP (RFC 3507).** HTTP proxies offload content adaptation, virus scanning, DLP, and content filtering to external ICAP servers that can modify or block request/response content. It is the closest *functional* precedent for content-aware egress control. Two details map directly onto our design: ICAP supports **pipelining** multiple servers (our middleware chain) and a **content preview** of the first bytes before full processing (our bounded-body buffering). What we avoid is its dated, text-based wire protocol; gRPC gives us typed contracts and a path to streaming.
+- **HashiCorp `go-plugin` (Terraform, Vault).** Third-party plugins run as separate processes and communicate with the core exclusively over gRPC. It shows a strictly typed gRPC contract is a robust way to manage cross-language third-party extensions, which informs our registration plus capability handshake (`GetCapabilities`, `ValidateConfig`).
+- **Kubernetes CSI / KMS.** Vendor-specific integrations are offloaded to external gRPC services rather than compiled into the core. Same "core defines the contract; integrators implement it out-of-process" split we use for middleware.
+- **Proxy-Wasm (Envoy/Istio Wasm filters).** In-process WebAssembly extensions with strong default-deny sandboxing and no IPC latency. Relevant to the future WASM deployment mode (see the deployment-options appendix); set aside for v1 because it is currently weak for GPU-backed or memory-heavy semantic guards.
 
 ## Open questions
 
